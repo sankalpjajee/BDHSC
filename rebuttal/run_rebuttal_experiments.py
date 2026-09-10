@@ -878,6 +878,8 @@ def fit_predict_cnn(raw: np.ndarray, y: np.ndarray, tr_idx: np.ndarray, te_idx: 
         t0 = time.time()
         for i in range(0, len(perm), bs):
             b = perm[i:i + bs]
+            if len(b) < 2:          # BatchNorm needs more than one sample in training mode
+                continue
             opt.zero_grad()
             loss = loss_fn(model(batch_tensor(b)), torch.from_numpy(y[b]).to(device))
             loss.backward()
@@ -1820,7 +1822,6 @@ def selfcheck() -> None:
     # full feature extraction on the test epochs
     F = extract_features_chunk(x)
     assert F.shape == (len(x), len(ALL_FEATURES)) and np.all(np.isfinite(F))
-    i = ALL_FEATURES.index("rel_delta")
     rel = F[:, [ALL_FEATURES.index(f"rel_{b}") for b in BANDS]].sum(axis=1)
     assert np.all(rel[rel > 0] <= 1.0 + 1e-9)
     print(f"[selfcheck] feature extraction ({len(ALL_FEATURES)} features) finite, relative powers <= 1 -> PASS")
