@@ -6,15 +6,15 @@ produces every number, table and figure the reviewers asked for:
 | Reviewer request | Where it is answered |
 |---|---|
 | Leave-one-animal-out / subject-level CV (gKQE 4, tinc 1, y2eZ 3) | stage `loao` (8 folds, group = animal) and `loro` (16 folds, group = animal-day) |
-| Quantify the inflation of the random epoch split (gKQE 4, tinc 1) | stage `random_split`: paper's stratified 80/20 split with the engineered set, +animal id, +raw samples, and a replica of the paper's design matrix |
+| Quantify the inflation of the random epoch split (gKQE 4, tinc 1) | stage `random_split`: paper's stratified 80/20 split with the engineered set, +animal id, +raw samples, and a replica of the paper's design matrix trained with the paper's actual headline configuration (library-default XGBoost, 100 trees, `multi:softprob`); stage `loao_replica`: the same paper design matrix under leave-one-animal-out — the direct subject-wise counterpart of the reported 91.5 % |
 | Comparison with standard / modern approaches (Xn1W 8, gKQE 3, y2eZ 4) | stage `loao`: logistic regression, random forest, RBF-SVM, MLP (128-64), class-balanced XGBoost; stage `cnn`: 1-D CNN on raw EEG (optional, needs `torch`) |
 | Ablation of MMD and the other feature groups (gKQE 5, y2eZ 2) | stage `ablation` (8 feature sets, XGBoost, LOAO) |
-| Statistical analysis (gKQE 5) | stage `stats`: paired Wilcoxon + paired t-test across folds, McNemar on pooled out-of-fold predictions, Cohen's d_z, rank-biserial r, Holm correction |
-| Dispersion measures / error bars (AC, Xn1W 6) | mean ± SD and 95 % t-CI across folds, plus animal-stratified bootstrap 95 % CI on pooled predictions; all bar charts carry fold-SD error bars and no empty gaps |
+| Statistical analysis (gKQE 5) | stage `stats`: paired t-test, exact Wilcoxon signed-rank and exact sign test across folds, McNemar on pooled out-of-fold predictions, Cohen's d_z, rank-biserial r, Holm correction (with 8 folds the smallest exact two-sided Wilcoxon/sign p is 0.0078) |
+| Dispersion measures / error bars (AC, Xn1W 6) | mean ± SD and approximate 95 % t-CI across folds (folds share training animals, so treat it as approximate), a within-animal epoch bootstrap **and** an animal-level (cluster) bootstrap 95 % CI on pooled predictions; all bar charts carry fold-SD error bars and no empty gaps |
 | Per-class results, especially REM (tinc 3) | `results/table_perclass.tex`, `figures/fig_perclass_f1_loao.*`, confusion matrix |
 | Cross-frequency coupling feature that is actually computed (tinc 2, title claim) | `pac_mi_theta_gamma`: Tort et al. (2010) modulation index, theta phase 6-9 Hz, gamma amplitude 30-100 Hz, 18 phase bins |
 | Welch PSD, relative power, peak frequency, spectral entropy as described in Methods III.B.1 | stage `features` |
-| Calibration with `multi:softmax` (tinc 4) | stage `calibration`: reliability curves, multiclass Brier, ECE; the code comment in `make_xgb` documents that `XGBClassifier.predict_proba` applies a softmax to the raw margins |
+| Calibration with `multi:softmax` (tinc 4) | stage `calibration`: per-class and top-label reliability curves (10 bins with counts), multiclass Brier, ECE, MCE, log-loss; the code comment in `make_xgb` documents that `XGBClassifier.predict_proba` applies a softmax to the raw margins |
 | Beeswarm vs bar mismatch (Xn1W 9) | stage `shap`: true beeswarm (one panel per class) **and** mean-abs-SHAP bar, plus gain importance |
 | Consistent figure style (AC, Xn1W 5) | all figures: same fonts, colour-blind-safe palette, 300 dpi PNG + vector PDF |
 
@@ -47,11 +47,11 @@ python run_rebuttal_experiments.py --synthetic 120 --quick --out-dir /tmp/rebutt
 
 # 3. the real thing (HPC path used by the NN script, or the notebook's relative path)
 python run_rebuttal_experiments.py \
-    --data-dir /work/sjajee/stage1_labeled \
+    --data-dir /path/to/stage1_labeled \
     --out-dir ./rebuttal_out \
     --label-map "0:Wake,1:SWS,2:REM" \
     --n-jobs 8
-#   or:  --data-dir ./bdhsc_2024/stage1_labeled
+#   (the directory that holds the 16 files 0_0.csv ... 7_1.csv)
 
 # resume after an interruption: same command again (finished stages are skipped)
 # run only some stages:            --stages stats,calibration,figures,report
@@ -74,7 +74,7 @@ statistics is the class whose name contains "REM", otherwise the rarest class.
 Stages run in this order and can be selected with `--stages a,b,c`:
 
 ```
-data  features  loao  loro  random_split  ablation  cnn  stats  calibration  shap  figures  report
+data  features  loao  loro  random_split  loao_replica  ablation  cnn  stats  calibration  shap  figures  report
 ```
 
 Every stage writes its outputs under `--out-dir` and is **skipped if its outputs
@@ -92,7 +92,8 @@ workstation (no GPU):
 | data (16 CSVs, ~9 GB) + features | 10-25 min |
 | loao (6 feature models) | 30-60 min |
 | loro (2 models × 16 folds) | 25-40 min |
-| random_split (4 variants × 3 repeats; the two raw-sample variants have 5,000+ columns) | 1.5-3 h |
+| random_split (4 variants × 3 repeats; the two raw-sample variants have 5,000+ columns; the replica uses 100 trees) | 1-2 h |
+| loao_replica (paper design matrix, 5,006 columns, 100 trees, 8 folds) | 2-3 h on 4 cores (skip with `--stages` if short of time) |
 | ablation (7 sets × 8 folds) | 1-1.5 h |
 | cnn (optional; CPU) | 2-4 h (minutes on a GPU) |
 | stats, calibration, shap, figures, report | < 10 min |
@@ -168,12 +169,17 @@ Per fold: accuracy, macro and weighted precision / recall / F1, per-class
 precision / recall / F1 / support, Cohen's κ, confusion matrix (counts and
 row-normalised). Aggregated: mean, SD, 95 % t-CI, min, max across folds
 (`results/cv_*_summary.csv`). Pooled out-of-fold predictions
-(`results/oof_*.npz`) get an animal-stratified percentile bootstrap (1000
-resamples, `results/bootstrap_*.csv`).
+(`results/oof_*.npz`) get two percentile bootstraps (1000 resamples each): a
+within-animal epoch bootstrap (`results/bootstrap_*.csv`, epoch-level sampling
+noise only) and an animal-level cluster bootstrap that resamples whole animals
+(`results/bootstrap_cluster_*.csv`, between-animal variability; coarse with 8
+animals). The fold SD / t-CI and the cluster bootstrap are the dispersion
+measures to report; the t-CI is approximate because LOAO folds share 6 of 7
+training animals.
 
 `results/stats_paired_tests.csv`: XGBoost vs every baseline and full set vs every
 ablation, for macro-F1, REM-F1, accuracy and κ — mean difference with 95 % CI,
-Cohen's d_z, paired t-test, Wilcoxon signed-rank (exact for n = 8),
+Cohen's d_z, paired t-test, Wilcoxon signed-rank (exact for n = 8), exact sign test,
 matched-pairs rank-biserial r, Holm-adjusted p-values.
 `results/stats_mcnemar.csv`: McNemar test on the pooled out-of-fold predictions
 (exact binomial when b + c < 25, otherwise χ² with continuity correction).
@@ -195,7 +201,8 @@ top-label and per-class ECE, log-loss (`results/calibration_*.csv`,
   results/
     cv_<protocol>__<model>_folds.csv      one row per fold, all metrics + confusion matrix
     cv_<protocol>__<model>_summary.csv    mean / SD / 95 % CI across folds
-    bootstrap_<protocol>__<model>.csv     bootstrap CIs on pooled predictions
+    bootstrap_<protocol>__<model>.csv     within-animal bootstrap CIs on pooled predictions
+    bootstrap_cluster_<protocol>__<model>.csv   animal-level (cluster) bootstrap CIs
     oof_<protocol>__<model>.npz           pooled out-of-fold predictions and probabilities
     stats_paired_tests.csv, stats_mcnemar.csv
     calibration_bins.csv, calibration_summary.csv
@@ -211,7 +218,7 @@ top-label and per-class ECE, log-loss (`results/calibration_*.csv`,
     fig_shap_beeswarm              SHAP beeswarm, one panel per class
     fig_shap_mean_abs_bar          mean |SHAP| per feature, stacked by class
     fig_xgb_gain_importance        XGBoost gain importance
-    fig_calibration_xgb_loao       reliability curves + ECE / Brier
+    fig_calibration_xgb_loao       reliability curves + ECE / MCE / Brier
   models/xgb_all_animals.json      XGBoost trained on all animals (SHAP model)
 ```
 

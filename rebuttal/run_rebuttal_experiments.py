@@ -49,7 +49,7 @@ Quick smoke test on synthetic data (no real data needed):
 
 Real data:
 
-    python run_rebuttal_experiments.py --data-dir /work/sjajee/stage1_labeled \\
+    python run_rebuttal_experiments.py --data-dir /path/to/stage1_labeled \\
         --out-dir ./rebuttal_out --label-map "0:Wake,1:SWS,2:REM" --n-jobs 8
 """
 from __future__ import annotations
@@ -212,10 +212,15 @@ RANDOM_VARIANTS = {
     "engineered": "Engineered set",
     "engineered_plus_animal": "Engineered + animal id",
     "engineered_plus_raw": "Engineered + raw samples",
-    "paper_replica": "Paper design matrix (raw + FFT powers + MMD + animal id)",
+    "paper_replica": "Paper design matrix (raw + FFT powers + MMD + animal id; paper's default XGBoost)",
 }
+# The paper's headline model (notebook cell 23) is XGBClassifier(num_class=3) with library defaults:
+# 100 trees, learning rate 0.3, depth 6, no subsampling, objective auto-set to multi:softprob.  The
+# replica rows use that configuration so that the leakage quantification reproduces the reported model.
+REPLICA_MODEL = "xgb_default"
+EXTRA_MODEL_LABELS = {"xgb_default": "XGBoost (paper default config)"}
 
-STAGES = ["data", "features", "loao", "loro", "random_split", "ablation", "cnn",
+STAGES = ["data", "features", "loao", "loro", "random_split", "loao_replica", "ablation", "cnn",
           "stats", "calibration", "shap", "figures", "report"]
 
 # Colour-blind-safe categorical palette (validated: adjacent-pair CVD dE >= 8).
@@ -719,10 +724,41 @@ def aggregate_folds(df: pd.DataFrame, class_names: Sequence[str]) -> pd.DataFram
     return pd.DataFrame(rows)
 
 
+def bootstrap_cluster(y_true: np.ndarray, y_pred: np.ndarray, clusters: np.ndarray, class_names: Sequence[str],
+                      n_boot: int, seed: int) -> pd.DataFrame:
+    """Cluster (animal-level / recording-level) percentile bootstrap of the pooled
+    out-of-fold predictions: whole clusters are resampled with replacement, so the
+    interval reflects between-animal variability (the exchangeable unit).  With 8
+    animals the interval is coarse and should be read alongside the fold SD."""
+    K = len(class_names)
+    rng = np.random.default_rng(seed + 1)
+    ids = np.unique(clusters)
+    members = {c: np.flatnonzero(clusters == c) for c in ids}
+    keys = ["accuracy", "precision_macro", "recall_macro", "f1_macro", "kappa"] + [f"f1_{c}" for c in class_names]
+    point = metrics_from_cm(confusion(y_true, y_pred, K), class_names)
+    samples = np.full((n_boot, len(keys)), np.nan)
+    for b in range(n_boot):
+        draw = rng.choice(ids, size=len(ids), replace=True)
+        idx = np.concatenate([members[c] for c in draw])
+        m = metrics_from_cm(confusion(y_true[idx], y_pred[idx], K), class_names)
+        samples[b] = [m[k] for k in keys]
+    rows = []
+    for j, k in enumerate(keys):
+        s = samples[:, j]
+        s = s[np.isfinite(s)]
+        rows.append({"metric": k, "point": point[k],
+                     "ci95_low": np.percentile(s, 2.5) if len(s) else np.nan,
+                     "ci95_high": np.percentile(s, 97.5) if len(s) else np.nan,
+                     "n_boot": int(len(s)), "n_clusters": int(len(ids))})
+    return pd.DataFrame(rows)
+
+
 def bootstrap_pooled(y_true: np.ndarray, y_pred: np.ndarray, strata: np.ndarray, class_names: Sequence[str],
                      n_boot: int, seed: int) -> pd.DataFrame:
-    """Percentile bootstrap (resampling epochs with replacement within each
-    animal, i.e. stratified by animal) of the pooled out-of-fold predictions."""
+    """Within-animal percentile bootstrap (epochs resampled with replacement inside
+    each animal) of the pooled out-of-fold predictions.  This captures sampling
+    noise at the epoch level only; between-animal variability is reported by the
+    fold SD / t-CI and by ``bootstrap_cluster``."""
     K = len(class_names)
     rng = np.random.default_rng(seed)
     groups = [np.flatnonzero(strata == s) for s in np.unique(strata)]
@@ -789,6 +825,10 @@ def build_feature_model(name: str, feature_names: Sequence[str], cfg: dict, seed
     pre = [("log", LogColumns(log_idx)), ("scale", StandardScaler())]
     if name in ("xgb", "xgb_balanced"):
         return make_xgb(cfg["xgb_trees"], seed, n_jobs)
+    if name == "xgb_default":
+        # library defaults as in the notebook's headline model (objective -> multi:softprob)
+        return xgb.XGBClassifier(n_estimators=cfg["xgb_default_trees"], random_state=seed, tree_method="hist",
+                                 n_jobs=max(1, n_jobs))
     if name == "logreg":
         return Pipeline(pre + [("clf", LogisticRegression(C=1.0, penalty="l2", max_iter=2000, random_state=seed))])
     if name == "rf":
@@ -1093,6 +1133,11 @@ def run_cv(ctx: Context, protocol: str, model_name: str, tag: str, X: Optional[n
     boot = bootstrap_pooled(np.concatenate(oof_true)[first], np.concatenate(oof_pred)[first],
                             meta["animal"].to_numpy()[idx][first], names, ctx.cfg["bootstrap"], ctx.args.seed)
     boot.to_csv(ctx.results / f"bootstrap_{tag}.csv", index=False)
+    cluster = (meta["animal"].astype(str) + "_" + meta["day"].astype(str)).to_numpy()[idx][first] \
+        if protocol == "loro" else meta["animal"].to_numpy()[idx][first]
+    bootstrap_cluster(np.concatenate(oof_true)[first], np.concatenate(oof_pred)[first], cluster, names,
+                      ctx.cfg["bootstrap"], ctx.args.seed).to_csv(ctx.results / f"bootstrap_cluster_{tag}.csv",
+                                                                 index=False)
     ctx.timings[tag] = tm.elapsed()
     LOG.info("[%s] done in %s: acc %.3f +- %.3f, macro-F1 %.3f +- %.3f, kappa %.3f +- %.3f", tag, hms(tm.elapsed()),
              df["accuracy"].mean(), df["accuracy"].std(), df["f1_macro"].mean(), df["f1_macro"].std(),
@@ -1150,8 +1195,33 @@ def stage_random_split(ctx: Context) -> None:
                            feature_matrix(ctx, LEGACY + ["mmd"]).astype(np.float32), animal])
             names = SAMPLE_COLS + LEGACY + ["mmd", "animal"]
         LOG.info("[random_split] variant %s: %d columns, %d repeats", variant, X.shape[1], len(splits))
-        run_cv(ctx, "random80_20", "xgb", tag, X, names, splits)
+        run_cv(ctx, "random80_20", REPLICA_MODEL if variant == "paper_replica" else "xgb", tag, X, names, splits)
         del X
+
+
+def replica_matrix(ctx: Context):
+    """The paper's design matrix: 5,000 raw samples + notebook FFT band powers + notebook MMD + animal id."""
+    animal = ctx.meta()["animal"].to_numpy(dtype=np.float32)[:, None]
+    X = np.hstack([np.asarray(ctx.raw(), dtype=np.float32),
+                   feature_matrix(ctx, LEGACY + ["mmd"]).astype(np.float32), animal])
+    return X, SAMPLE_COLS + LEGACY + ["mmd", "animal"]
+
+
+def stage_loao_replica(ctx: Context) -> None:
+    """Leave-one-animal-out evaluation of the paper's own design matrix and default XGBoost
+    configuration: the direct, leakage-free counterpart of the reported 91.5 %.  With the raw
+    samples as columns this is the most expensive tabular stage (roughly 8 x 20 min on 4 cores
+    for the real data); skip it with --stages if time is short."""
+    tag = f"loao__{REPLICA_MODEL}_paper_replica"
+    if (ctx.results / f"cv_{tag}_folds.csv").exists() and not ctx.args.force:
+        LOG.info("[%s] outputs exist, skipping", tag)
+        return
+    X, names = replica_matrix(ctx)
+    splits = make_splits("loao", ctx.meta(), ctx.y())
+    LOG.info("[loao_replica] %d folds, %d columns (paper design matrix), model %s", len(splits), X.shape[1],
+             REPLICA_MODEL)
+    run_cv(ctx, "loao", REPLICA_MODEL, tag, X, names, splits)
+    del X
 
 
 def stage_ablation(ctx: Context) -> None:
@@ -1217,8 +1287,13 @@ def paired_tests(a: np.ndarray, b: np.ndarray) -> Dict[str, float]:
             ranks = stats.rankdata(np.abs(nz))
             wp, wm = ranks[nz > 0].sum(), ranks[nz < 0].sum()
             out["rank_biserial_r"] = (wp - wm) / (wp + wm)
+            # exact two-sided sign test on the non-zero differences (needs only exchangeable signs)
+            n_pos, n_nz = int((nz > 0).sum()), int(len(nz))
+            out["sign_n_pos"], out["sign_n_nonzero"] = n_pos, n_nz
+            out["sign_p"] = float(stats.binomtest(n_pos, n_nz, 0.5).pvalue)
         else:
             out["wilcoxon_stat"], out["wilcoxon_p"], out["rank_biserial_r"] = np.nan, np.nan, 0.0
+            out["sign_n_pos"], out["sign_n_nonzero"], out["sign_p"] = 0, 0, np.nan
     return out
 
 
@@ -1311,25 +1386,31 @@ def calibration_tables(y_true: np.ndarray, proba: np.ndarray, class_names: Seque
     summ["log_loss"] = float(-np.mean(np.log(np.clip(proba[np.arange(len(y_true)), y_true], 1e-12, 1))))
     conf, pred = proba.max(axis=1), proba.argmax(axis=1)
     b = np.clip(np.digitize(conf, edges) - 1, 0, n_bins - 1)
-    ece = 0.0
+    ece, mce = 0.0, 0.0
     for k in range(n_bins):
         m = b == k
         if m.any():
-            ece += m.mean() * abs((pred[m] == y_true[m]).mean() - conf[m].mean())
+            gap = abs((pred[m] == y_true[m]).mean() - conf[m].mean())
+            ece += m.mean() * gap
+            mce = max(mce, gap)
             rows.append({"class": "top-label", "bin": k, "lower": edges[k], "upper": edges[k + 1], "n": int(m.sum()),
                          "mean_confidence": float(conf[m].mean()), "accuracy": float((pred[m] == y_true[m]).mean())})
     summ["ece_top_label"] = float(ece)
+    summ["mce_top_label"] = float(mce)
     for c, name in enumerate(class_names):
         p, yb = proba[:, c], (y_true == c).astype(float)
         bc = np.clip(np.digitize(p, edges) - 1, 0, n_bins - 1)
-        ece_c = 0.0
+        ece_c, mce_c = 0.0, 0.0
         for k in range(n_bins):
             m = bc == k
             if m.any():
-                ece_c += m.mean() * abs(yb[m].mean() - p[m].mean())
+                gap = abs(yb[m].mean() - p[m].mean())
+                ece_c += m.mean() * gap
+                mce_c = max(mce_c, gap)
                 rows.append({"class": name, "bin": k, "lower": edges[k], "upper": edges[k + 1], "n": int(m.sum()),
                              "mean_confidence": float(p[m].mean()), "accuracy": float(yb[m].mean())})
         summ[f"ece_{name}"] = float(ece_c)
+        summ[f"mce_{name}"] = float(mce_c)
         summ[f"brier_{name}"] = float(np.mean((p - yb) ** 2))
     summ["n"] = int(len(y_true))
     return pd.DataFrame(rows), summ
@@ -1524,7 +1605,8 @@ def stage_figures(ctx: Context) -> None:
         grouped_bar(ax, names, series_pc, "Per-class F1 (LOAO, mean ± SD)")
         save_fig(fig, ctx.figures / "fig_perclass_f1_loao")
     # --- protocols (XGBoost)
-    prot = [("loao__xgb", "Leave-one-animal-out"), ("loro__xgb", "Leave-one-recording-out")]
+    prot = [("loao__xgb", "Leave-one-animal-out"), ("loro__xgb", "Leave-one-recording-out"),
+            (f"loao__{REPLICA_MODEL}_paper_replica", "LOAO: paper design matrix")]
     prot += [(f"random80_20__xgb__{v}", f"Random 80/20: {RANDOM_VARIANTS[v].split(' (')[0]}") for v in RANDOM_VARIANTS]
     prot = [(t, l) for t, l in prot if (ctx.results / f"cv_{t}_summary.csv").exists()]
     if prot:
@@ -1674,6 +1756,9 @@ def stage_report(ctx: Context) -> None:
         d = _summary_dict(ctx, f"random80_20__xgb__{v}")
         if d:
             protocols["random80_20"][v] = d
+    d = _summary_dict(ctx, f"loao__{REPLICA_MODEL}_paper_replica")
+    if d:
+        protocols["loao"]["paper_replica"] = d
     for a in ABLATIONS:
         d = _summary_dict(ctx, "loao__xgb" if a == "full" else f"loao__xgb_abl_{a}")
         if d:
@@ -1706,7 +1791,8 @@ def stage_report(ctx: Context) -> None:
         return f"{protocol_label} & {tex(model_label)} & " + " & ".join(cells) + " \\\\"
 
     n_animals, n_rec = ctx.meta()["animal"].nunique(), ctx.meta().groupby(["animal", "day"]).ngroups
-    blocks = [(f"LOAO ({n_animals} folds)", [(MODEL_LABELS[m], f"loao__{m}") for m in MODEL_ORDER]),
+    blocks = [(f"LOAO ({n_animals} folds)", [(MODEL_LABELS[m], f"loao__{m}") for m in MODEL_ORDER]
+               + [(f"XGBoost, {RANDOM_VARIANTS['paper_replica']}", f"loao__{REPLICA_MODEL}_paper_replica")]),
               (f"LORO ({n_rec} folds)", [(MODEL_LABELS[m], f"loro__{m}") for m in MODEL_ORDER]),
               ("Random 80/20 epochs", [(f"XGBoost, {RANDOM_VARIANTS[v]}", f"random80_20__xgb__{v}") for v in RANDOM_VARIANTS])]
     for label, items in blocks:
@@ -1928,6 +2014,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         raise SystemExit(f"unknown stages {unknown}; valid: {STAGES}")
     cfg = {
         "xgb_trees": 60 if args.quick else 500,
+        "xgb_default_trees": 20 if args.quick else 100,
         "rf_trees": 100 if args.quick else 500,
         "mlp_max_iter": 60 if args.quick else 200,
         "svm_max_train": min(args.svm_max_train, 4000) if args.quick else args.svm_max_train,
@@ -1962,6 +2049,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "loro": lambda: stage_loro(ctx),
         "random_split": lambda: stage_random_split(ctx),
         "ablation": lambda: stage_ablation(ctx),
+        "loao_replica": lambda: stage_loao_replica(ctx),
         "cnn": lambda: stage_cnn(ctx),
         "stats": lambda: stage_stats(ctx),
         "calibration": lambda: stage_calibration(ctx),
