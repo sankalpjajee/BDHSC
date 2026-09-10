@@ -269,7 +269,7 @@ class LogColumns(BaseEstimator, TransformerMixin):
     """log10(x + eps) on selected (non-negative, heavy-tailed) columns."""
 
     def __init__(self, columns: Sequence[int] = (), eps: float = EPS):
-        self.columns = list(columns)
+        self.columns = columns          # stored unmodified (sklearn clone contract)
         self.eps = eps
 
     def fit(self, X, y=None):
@@ -277,8 +277,8 @@ class LogColumns(BaseEstimator, TransformerMixin):
 
     def transform(self, X):
         X = np.array(X, dtype=np.float64, copy=True)
-        if self.columns:
-            cols = np.asarray(self.columns, dtype=int)
+        if len(self.columns):
+            cols = np.asarray(list(self.columns), dtype=int)
             X[:, cols] = np.log10(np.clip(X[:, cols], 0.0, None) + self.eps)
         return X
 
@@ -419,7 +419,7 @@ def discover_files(data_dir: Path) -> List[Tuple[int, int, Path]]:
     return files
 
 
-def _read_one_csv(path: Path, dtype: str) -> Tuple[np.ndarray, np.ndarray]:
+def _read_one_csv(path: Path, dtype: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     df = pd.read_csv(path, dtype=np.float32 if dtype == "float32" else np.float64)
     missing = [c for c in SAMPLE_COLS + [LABEL_COL] if c not in df.columns]
     if missing:
@@ -431,7 +431,8 @@ def _read_one_csv(path: Path, dtype: str) -> Tuple[np.ndarray, np.ndarray]:
     lab = df[LABEL_COL].to_numpy()
     if not np.all(np.isfinite(lab)) or not np.allclose(lab, np.round(lab)):
         raise ValueError(f"{path.name}: labels in column '5000' are not integers")
-    return x, np.round(lab).astype(np.int64)
+    flat = x.max(axis=1) == x.min(axis=1)          # constant (drop-out) epochs
+    return x, np.round(lab).astype(np.int64), flat
 
 
 def load_or_cache_raw(data_dir: Path, cache_dir: Path, dtype: str, n_jobs: int,
@@ -447,11 +448,13 @@ def load_or_cache_raw(data_dir: Path, cache_dir: Path, dtype: str, n_jobs: int,
     parts = Parallel(n_jobs=max(1, min(n_jobs, 4)))(
         delayed(_read_one_csv)(p, dtype) for _, _, p in files)
     raws, metas = [], []
-    for (a, d, p), (x, lab) in zip(files, parts):
+    for (a, d, p), (x, lab, flat) in zip(files, parts):
         raws.append(x)
-        metas.append(pd.DataFrame({"animal": a, "day": d, "epoch_idx": np.arange(len(lab)), "label": lab}))
+        metas.append(pd.DataFrame({"animal": a, "day": d, "epoch_idx": np.arange(len(lab)), "label": lab,
+                                   "is_flat": flat}))
         u, c = np.unique(lab, return_counts=True)
-        LOG.info("[data]   %s: %d epochs, labels %s", p.name, len(lab), {int(k): int(v) for k, v in zip(u, c)})
+        LOG.info("[data]   %s: %d epochs, labels %s, %d constant (flat) epochs", p.name, len(lab),
+                 {int(k): int(v) for k, v in zip(u, c)}, int(flat.sum()))
     raw = np.concatenate(raws, axis=0)
     meta = pd.concat(metas, ignore_index=True)
     np.save(raw_path, raw)
@@ -821,7 +824,8 @@ def fit_predict_features(name: str, X_tr, y_tr, X_te, feature_names, cfg, seed, 
 # Optional 1-D CNN on raw epochs (torch)
 # ----------------------------------------------------------------------------
 def fit_predict_cnn(raw: np.ndarray, y: np.ndarray, tr_idx: np.ndarray, te_idx: np.ndarray,
-                    groups_tr: np.ndarray, K: int, cfg: dict, seed: int, n_jobs: int):
+                    groups_tr: np.ndarray, K: int, cfg: dict, seed: int, n_jobs: int,
+                    groups_te: Optional[np.ndarray] = None):
     """Small 1-D CNN (4 conv blocks) on per-epoch z-scored raw EEG.  One training
     animal is held out for early stopping.  Returns (y_pred, proba)."""
     import torch.nn as nn  # type: ignore
@@ -851,7 +855,10 @@ def fit_predict_cnn(raw: np.ndarray, y: np.ndarray, tr_idx: np.ndarray, te_idx: 
         x = (x - x.mean(axis=1, keepdims=True)) / (x.std(axis=1, keepdims=True) + 1e-6)
         return torch.from_numpy(x[:, None, :]).to(device)
 
-    val_group = np.min(groups_tr)
+    val_group = np.min(groups_tr)          # one TRAINING animal, held out for early stopping
+    if groups_te is not None:
+        assert val_group not in set(np.unique(groups_te).tolist()), \
+            "CNN early-stopping animal must be a training animal, never the test animal"
     val_mask = groups_tr == val_group
     fit_idx, val_idx = tr_idx[~val_mask], tr_idx[val_mask]
     model = SmallCNN(K).to(device)
@@ -946,6 +953,12 @@ class Context:
 
     def _setup_classes(self) -> None:
         meta = self._meta
+        if "is_flat" not in meta.columns:   # cache written by an older version: derive from the raw epochs
+            raw = self._raw
+            meta["is_flat"] = np.concatenate([
+                np.asarray(raw[i:i + 5000]).max(axis=1) == np.asarray(raw[i:i + 5000]).min(axis=1)
+                for i in range(0, raw.shape[0], 5000)])
+        flat = meta["is_flat"].to_numpy(dtype=bool)
         vals, counts = np.unique(meta["label"].to_numpy(), return_counts=True)
         self.class_values = [int(v) for v in vals]
         lm = parse_label_map(self.args.label_map)
@@ -970,11 +983,20 @@ class Context:
                         self.rem_class)
         LOG.info("[data] classes %s counts %s (REM class for statistics: %s)", self.class_names,
                  counts.tolist(), self.rem_class)
+        lab = meta["label"].to_numpy()
+        flat_by_class = {n: int(((lab == v) & flat).sum()) for n, v in zip(self.class_names, self.class_values)}
+        if flat.any():
+            LOG.warning("[data] %d constant (drop-out) epochs = %.2f%% of the data are kept; by class %s. Their "
+                        "spectral features, Hjorth parameters, MMD and PAC are 0 (see results/data_summary.json).",
+                        int(flat.sum()), 100.0 * flat.mean(), flat_by_class)
         summary = {"n_epochs": int(len(meta)), "n_animals": int(meta["animal"].nunique()),
                    "n_recordings": int(meta.groupby(["animal", "day"]).ngroups),
                    "class_values": self.class_values, "class_names": self.class_names,
                    "class_counts": {n: int(c) for n, c in zip(self.class_names, counts)},
                    "label_map_confirmed": lm is not None,
+                   "n_flat_epochs": int(flat.sum()), "flat_epochs_by_class": flat_by_class,
+                   "flat_epochs_per_recording": [{"animal": int(a), "day": int(d), "n_flat": int(c)} for (a, d), c in
+                                                 meta.groupby(["animal", "day"])["is_flat"].sum().items()],
                    "per_recording": meta.groupby(["animal", "day"])["label"].value_counts().unstack(fill_value=0)
                    .reset_index().to_dict(orient="records")}
         with open(self.results / "data_summary.json", "w") as fh:
@@ -1022,12 +1044,24 @@ def run_cv(ctx: Context, protocol: str, model_name: str, tag: str, X: Optional[n
     names = ctx.class_names
     rows = []
     oof_idx, oof_true, oof_pred, oof_proba, oof_fold = [], [], [], [], []
+    animal = meta["animal"].to_numpy()
+    recording = (meta["animal"].astype(str) + "_" + meta["day"].astype(str)).to_numpy()
     tm = Timer(tag)
     for k, (fname, tr, te) in enumerate(splits):
         t0 = time.time()
+        # Leakage guards: the test epochs are never in the training fold and, under the group-wise
+        # protocols, neither is any epoch of the test animal (LOAO) / test recording (LORO).
+        assert np.intersect1d(tr, te).size == 0, f"{tag} {fname}: train/test epoch overlap"
+        if protocol == "loao":
+            assert not (set(animal[tr].tolist()) & set(animal[te].tolist())), \
+                f"{tag} {fname}: test animal present in the training fold"
+        elif protocol == "loro":
+            assert not (set(recording[tr].tolist()) & set(recording[te].tolist())), \
+                f"{tag} {fname}: test recording present in the training fold"
         if use_raw:
-            groups_tr = meta["animal"].to_numpy()[tr]
-            y_pred, proba = fit_predict_cnn(ctx.raw(), y, tr, te, groups_tr, K, ctx.cfg, ctx.args.seed, ctx.args.n_jobs)
+            groups_tr = animal[tr]
+            y_pred, proba = fit_predict_cnn(ctx.raw(), y, tr, te, groups_tr, K, ctx.cfg, ctx.args.seed,
+                                            ctx.args.n_jobs, groups_te=animal[te])
         else:
             y_pred, proba = fit_predict_features(model_name, X[tr], y[tr], X[te], feature_names, ctx.cfg,
                                                  ctx.args.seed, ctx.args.n_jobs)
@@ -1142,7 +1176,7 @@ def stage_cnn(ctx: Context) -> None:
 # ---- statistics ---------------------------------------------------------------
 def holm(p: np.ndarray) -> np.ndarray:
     p = np.asarray(p, dtype=np.float64)
-    n = len(p)
+    n = int(np.isfinite(p).sum())      # NaN p-values (untestable comparisons) are not tests
     order = np.argsort(p)
     adj = np.empty(n)
     running = 0.0
@@ -1171,7 +1205,12 @@ def paired_tests(a: np.ndarray, b: np.ndarray) -> Dict[str, float]:
         nz = d[d != 0]
         if len(nz) > 0:
             try:
-                w = stats.wilcoxon(a, b, zero_method="wilcox", alternative="two-sided")
+                try:    # exact null distribution (n <= 16 folds); older scipy: fall back to its default
+                    w = stats.wilcoxon(a, b, zero_method="wilcox", alternative="two-sided", method="exact")
+                    out["wilcoxon_method"] = "exact"
+                except (TypeError, ValueError):
+                    w = stats.wilcoxon(a, b, zero_method="wilcox", alternative="two-sided")
+                    out["wilcoxon_method"] = "scipy-auto"
                 out["wilcoxon_stat"], out["wilcoxon_p"] = float(w.statistic), float(w.pvalue)
             except Exception:
                 out["wilcoxon_stat"], out["wilcoxon_p"] = np.nan, np.nan
@@ -1582,6 +1621,11 @@ def fmt_pm(mean: float, sd: float, digits: int = 3) -> str:
     return f"{mean:.{digits}f} $\\pm$ {sd:.{digits}f}"
 
 
+def tex(s) -> str:
+    """Escape the LaTeX special characters that can occur in class / feature / model labels."""
+    return re.sub(r"([_%&#])", r"\\\1", str(s))
+
+
 def _summary_dict(ctx: Context, tag: str) -> Optional[dict]:
     p = ctx.results / f"cv_{tag}_summary.csv"
     if not p.exists():
@@ -1659,10 +1703,11 @@ def stage_report(ctx: Context) -> None:
         if not d:
             return None
         cells = [fmt_pm(d["metrics"][c]["mean"], d["metrics"][c]["sd"]) for c in cols]
-        return f"{protocol_label} & {model_label} & " + " & ".join(cells) + " \\\\"
+        return f"{protocol_label} & {tex(model_label)} & " + " & ".join(cells) + " \\\\"
 
-    blocks = [("LOAO (8 folds)", [(MODEL_LABELS[m], f"loao__{m}") for m in MODEL_ORDER]),
-              ("LORO (16 folds)", [(MODEL_LABELS[m], f"loro__{m}") for m in MODEL_ORDER]),
+    n_animals, n_rec = ctx.meta()["animal"].nunique(), ctx.meta().groupby(["animal", "day"]).ngroups
+    blocks = [(f"LOAO ({n_animals} folds)", [(MODEL_LABELS[m], f"loao__{m}") for m in MODEL_ORDER]),
+              (f"LORO ({n_rec} folds)", [(MODEL_LABELS[m], f"loro__{m}") for m in MODEL_ORDER]),
               ("Random 80/20 epochs", [(f"XGBoost, {RANDOM_VARIANTS[v]}", f"random80_20__xgb__{v}") for v in RANDOM_VARIANTS])]
     for label, items in blocks:
         rows = [r for r in (row(label if i == 0 else "", ml, t) for i, (ml, t) in enumerate(items)) if r]
@@ -1681,16 +1726,16 @@ def stage_report(ctx: Context) -> None:
         for c in names:
             b = d.get("bootstrap", {}).get(f"f1_{c}", {})
             ci = f"[{b['ci95_low']:.3f}, {b['ci95_high']:.3f}]" if b else "--"
-            lines.append(f"{c} & " + " & ".join(
+            lines.append(f"{tex(c)} & " + " & ".join(
                 fmt_pm(d["metrics"][f"{m}_{c}"]["mean"], d["metrics"][f"{m}_{c}"]["sd"])
                 for m in ("precision", "recall", "f1")) + f" & {ci} \\\\")
     lines += ["\\midrule", "\\multicolumn{5}{l}{\\textit{Per-class F1 of every model (LOAO): "
-              + ", ".join(names) + "}} \\\\"]
+              + ", ".join(tex(n) for n in names) + "}} \\\\"]
     pad = " & " * max(0, 4 - len(names))
     for m in MODEL_ORDER:
         dm = _summary_dict(ctx, f"loao__{m}")
         if dm:
-            lines.append(f"{MODEL_LABELS[m]} & " + " & ".join(
+            lines.append(f"{tex(MODEL_LABELS[m])} & " + " & ".join(
                 fmt_pm(dm["metrics"][f"f1_{c}"]["mean"], dm["metrics"][f"f1_{c}"]["sd"])
                 for c in names) + pad + " \\\\")
     lines += ["\\bottomrule", "\\end{tabular}"]
@@ -1700,7 +1745,7 @@ def stage_report(ctx: Context) -> None:
     st = pd.read_csv(res / "stats_paired_tests.csv") if (res / "stats_paired_tests.csv").exists() else None
     lines = ["% Generated by run_rebuttal_experiments.py -- XGBoost, leave-one-animal-out",
              "\\begin{tabular}{lccccc}", "\\toprule",
-             f"Feature set & \\#feat. & Accuracy & F1 (macro) & F1 ({rem}) & $\\Delta$F1 vs.\\ full (Wilcoxon $p$) \\\\",
+             f"Feature set & \\#feat. & Accuracy & F1 (macro) & F1 ({tex(rem)}) & $\\Delta$F1 vs.\\ full (Wilcoxon $p$) \\\\",
              "\\midrule"]
     for a in ABLATIONS:
         tag = "loao__xgb" if a == "full" else f"loao__xgb_abl_{a}"
@@ -1713,7 +1758,7 @@ def stage_report(ctx: Context) -> None:
             if len(s):
                 r = s.iloc[0]
                 delta = f"{-r['mean_diff']:+.3f} ({r['wilcoxon_p']:.3f})" if np.isfinite(r["wilcoxon_p"]) else f"{-r['mean_diff']:+.3f}"
-        lines.append(f"{ABLATION_LABELS[a]} & {len(ABLATIONS[a])} & "
+        lines.append(f"{tex(ABLATION_LABELS[a])} & {len(ABLATIONS[a])} & "
                      + " & ".join(fmt_pm(da["metrics"][c]["mean"], da["metrics"][c]["sd"])
                                   for c in ("accuracy", "f1_macro", f"f1_{rem}")) + f" & {delta} \\\\")
     lines += ["\\bottomrule", "\\end{tabular}"]
@@ -1824,6 +1869,11 @@ def selfcheck() -> None:
     assert F.shape == (len(x), len(ALL_FEATURES)) and np.all(np.isfinite(F))
     rel = F[:, [ALL_FEATURES.index(f"rel_{b}") for b in BANDS]].sum(axis=1)
     assert np.all(rel[rel > 0] <= 1.0 + 1e-9)
+    flat_row = F[5]
+    for name in ["abs_delta", "total_power", "spectral_entropy", "hjorth_activity", "hjorth_mobility",
+                 "hjorth_complexity", "line_length", "zero_crossing_rate", "mmd", "mmd_uV", "pac_mi_theta_gamma"]:
+        assert abs(flat_row[ALL_FEATURES.index(name)]) < 1e-9, f"flat epoch: {name} = {flat_row[ALL_FEATURES.index(name)]}"
+    print("[selfcheck] constant (flat) epoch -> all spectral / Hjorth / MMD / PAC features are exactly 0, no NaN -> PASS")
     print(f"[selfcheck] feature extraction ({len(ALL_FEATURES)} features) finite, relative powers <= 1 -> PASS")
     # XGBoost predict_proba under multi:softmax must return proper probabilities
     clf = make_xgb(20, 0, 1).fit(F[:, :len(ENGINEERED)], yt[:len(x)])
