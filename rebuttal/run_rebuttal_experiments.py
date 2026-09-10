@@ -54,11 +54,17 @@ Real data:
 """
 from __future__ import annotations
 
+import os
+
+# OpenMP threads that spin-wait can stall XGBoost / OpenBLAS by 50-100x on
+# CPU-throttled machines (containers, shared HPC nodes).  A passive wait policy
+# costs nothing on a dedicated workstation.  Must be set before numpy is imported.
+os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
+
 import argparse
 import json
 import logging
 import math
-import os
 import re
 import sys
 import time
@@ -416,8 +422,8 @@ def load_or_cache_raw(data_dir: Path, cache_dir: Path, dtype: str, n_jobs: int,
     for (a, d, p), (x, lab) in zip(files, parts):
         raws.append(x)
         metas.append(pd.DataFrame({"animal": a, "day": d, "epoch_idx": np.arange(len(lab)), "label": lab}))
-        LOG.info("[data]   %s: %d epochs, labels %s", p.name, len(lab),
-                 dict(zip(*np.unique(lab, return_counts=True))))
+        u, c = np.unique(lab, return_counts=True)
+        LOG.info("[data]   %s: %d epochs, labels %s", p.name, len(lab), {int(k): int(v) for k, v in zip(u, c)})
     raw = np.concatenate(raws, axis=0)
     meta = pd.concat(metas, ignore_index=True)
     np.save(raw_path, raw)
@@ -1328,15 +1334,19 @@ def stage_shap(ctx: Context) -> None:
     setup_style()
     K = len(ctx.class_names)
     try:
-        fig, axes = plt.subplots(1, K, figsize=(3.2 * K, 4.6))
+        from matplotlib.ticker import MaxNLocator
+
+        fig, axes = plt.subplots(1, K, figsize=(4.4 * K, 4.4))
         axes = np.atleast_1d(axes)
         for c, name in enumerate(ctx.class_names):
             plt.sca(axes[c])
             shap.summary_plot(sv_list[c], Xs, feature_names=ENGINEERED, show=False, plot_size=None,
-                              max_display=15, color_bar=(c == K - 1))
+                              max_display=12, color_bar=(c == K - 1))
             axes[c].set_title(f"SHAP: {name}")
             axes[c].set_xlabel("SHAP value (log-odds)")
-        fig.tight_layout()
+            axes[c].xaxis.set_major_locator(MaxNLocator(4))
+            axes[c].tick_params(axis="y", labelsize=7.5)
+        fig.tight_layout(w_pad=2.0)
         save_fig(fig, ctx.figures / "fig_shap_beeswarm")
     except Exception as e:  # pragma: no cover
         LOG.warning("[shap] multi-panel beeswarm failed (%s); writing one file per class", e)
@@ -1445,14 +1455,14 @@ def stage_figures(ctx: Context) -> None:
         grouped_bar(ax, names, series_pc, "Per-class F1 (LOAO, mean ± SD)")
         save_fig(fig, ctx.figures / "fig_perclass_f1_loao")
     # --- protocols (XGBoost)
-    prot = [("loao__xgb", "LOAO"), ("loro__xgb", "Leave-one-\nrecording-out")]
-    prot += [(f"random80_20__xgb__{v}", f"Random 80/20\n{RANDOM_VARIANTS[v].split(' (')[0]}") for v in RANDOM_VARIANTS]
+    prot = [("loao__xgb", "Leave-one-animal-out"), ("loro__xgb", "Leave-one-recording-out")]
+    prot += [(f"random80_20__xgb__{v}", f"Random 80/20: {RANDOM_VARIANTS[v].split(' (')[0]}") for v in RANDOM_VARIANTS]
     prot = [(t, l) for t, l in prot if (ctx.results / f"cv_{t}_summary.csv").exists()]
     if prot:
         series_p = []
         for i, (tag, label) in enumerate(prot):
             vals = np.array([_summary_value(ctx, tag, c) for c in ["accuracy", "f1_macro", f"f1_{ctx.rem_class}", "kappa"]])
-            series_p.append((label.replace("\n", " "), vals[:, 0], vals[:, 1], PALETTE[i % len(PALETTE)]))
+            series_p.append((label, vals[:, 0], vals[:, 1], PALETTE[i % len(PALETTE)]))
         fig, ax = plt.subplots(figsize=(6.8, 3.0))
         grouped_bar(ax, ["Accuracy", "F1 (macro)", f"F1 ({ctx.rem_class})", "Cohen's κ"], series_p,
                     "XGBoost score (mean ± SD over folds / repeats)", legend_cols=3)
