@@ -45,17 +45,22 @@ python run_rebuttal_experiments.py --selfcheck
 # 2. smoke test on synthetic data (no real data needed, ~5-10 min)
 python run_rebuttal_experiments.py --synthetic 120 --quick --out-dir /tmp/rebuttal_smoke
 
-# 3. the real thing
+# 3. the real thing (HPC path used by the NN script, or the notebook's relative path)
 python run_rebuttal_experiments.py \
     --data-dir /work/sjajee/stage1_labeled \
     --out-dir ./rebuttal_out \
     --label-map "0:Wake,1:SWS,2:REM" \
     --n-jobs 8
+#   or:  --data-dir ./bdhsc_2024/stage1_labeled
+
+# resume after an interruption: same command again (finished stages are skipped)
+# run only some stages:            --stages stats,calibration,figures,report
 ```
 
 `--data-dir` must contain the 16 files `{animal}_{day}.csv` exactly as used in
 the notebook (columns `"0"`..`"4999"` = samples of one 10-s epoch at 500 Hz, in
-volts; column `"5000"` = integer label).
+volts; column `"5000"` = integer label). Nothing is modified in that directory;
+all outputs go to `--out-dir`.
 
 **Label mapping.** The notebook never states which integer is Wake / SWS / REM.
 Without `--label-map` the script prints the class counts, names the classes
