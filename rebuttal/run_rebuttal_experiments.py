@@ -319,52 +319,80 @@ def generate_synthetic_dataset(dest: Path, n_per_file: int, seed: int,
                                n_animals: int = 8, n_days: int = 2) -> None:
     """Write {animal}_{day}.csv files with realistic three-state synthetic EEG.
 
-    SWS : 1-4 Hz high-amplitude oscillation + pink noise
+    SWS : 1-4 Hz high-amplitude oscillation (variable amplitude) + pink noise
     REM : 6-9 Hz theta, low amplitude, with theta-phase-modulated gamma (PAC)
-    Wake: broadband (pink + white) low amplitude + unmodulated gamma + weak theta
-    Animal-specific gain, frequency offset, noise colour and 50 Hz pickup make
-    animals distinguishable, so the animal id is (as in the real data) a useful
-    leakage feature under a random epoch split.  Values are written in volts.
+    Wake: broadband (pink + white) low amplitude + unmodulated gamma + theta
+          (active wake also carries 5-9 Hz theta, as in real rodents) + artefacts
+    Difficulty comes from per-epoch amplitude jitter, overlapping amplitude
+    ranges, transitional (mixed) epochs at state changes and strong animal
+    effects (gain, frequency offset, noise colour, gamma gain, 50 Hz pickup).
+    The animal effects make the animal id a useful leakage feature under a
+    random epoch split, as in the real data.  Values are written in volts.
     """
     dest.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(seed)
     t = np.arange(N_SAMPLES) / FS
     sos_gamma = signal.butter(4, [30.0, 100.0], btype="bandpass", fs=FS, output="sos")
+
+    def synth(states: np.ndarray, gain: float, f_off: float, pink_exp: float, gamma_gain: float,
+              delta_gain: float, theta_gain: float) -> np.ndarray:
+        n = len(states)
+        pink = _pink_noise(n, N_SAMPLES, rng, pink_exp)
+        gam = signal.sosfilt(sos_gamma, rng.standard_normal((n, N_SAMPLES)), axis=-1)
+        gam /= gam.std(axis=-1, keepdims=True) + 1e-12
+        white = rng.standard_normal((n, N_SAMPLES))
+        phase = rng.uniform(0, 2 * np.pi, size=(n, 1))
+        jit = np.exp(rng.normal(0.0, 0.35, size=(n, 1)))     # per-epoch amplitude jitter
+        sig = np.zeros((n, N_SAMPLES))
+        m = states == 1                                       # SWS
+        if m.any():
+            k = m.sum()
+            f = rng.uniform(1.0, 4.0, size=(k, 1)) + 0.3 * f_off
+            env = 1.0 + 0.6 * np.sin(2 * np.pi * rng.uniform(0.1, 0.4, size=(k, 1)) * t + rng.uniform(0, 6.28, size=(k, 1)))
+            sig[m] = (delta_gain * rng.uniform(22, 60, size=(k, 1)) * env * np.sin(2 * np.pi * f * t + phase[m])
+                      + rng.uniform(4, 14, size=(k, 1)) * np.sin(2 * np.pi * rng.uniform(4, 8, size=(k, 1)) * t)
+                      + rng.uniform(14, 26, size=(k, 1)) * pink[m] + 3 * gamma_gain * gam[m])
+        m = states == 2                                       # REM: theta + theta-locked gamma
+        if m.any():
+            k = m.sum()
+            f = rng.uniform(6.0, 9.0, size=(k, 1)) + f_off
+            th = 2 * np.pi * f * t + phase[m]
+            depth = rng.uniform(0.3, 0.9, size=(k, 1))
+            sig[m] = (theta_gain * rng.uniform(10, 30, size=(k, 1)) * np.sin(th)
+                      + 5 * gamma_gain * (1.0 + depth * np.cos(th)) * gam[m]
+                      + rng.uniform(4, 14, size=(k, 1)) * np.sin(2 * np.pi * rng.uniform(1, 4, size=(k, 1)) * t)
+                      + rng.uniform(10, 20, size=(k, 1)) * pink[m])
+        m = states == 0                                       # Wake
+        if m.any():
+            k = m.sum()
+            f = rng.uniform(5.0, 9.0, size=(k, 1)) + f_off
+            sig[m] = (rng.uniform(12, 26, size=(k, 1)) * pink[m] + rng.uniform(4, 11, size=(k, 1)) * gamma_gain * gam[m]
+                      + rng.uniform(4, 9, size=(k, 1)) * white[m]
+                      + theta_gain * rng.uniform(4, 20, size=(k, 1)) * np.sin(2 * np.pi * f * t + phase[m]))
+            art = m & (rng.random(n) < 0.10)                  # movement artefacts in 10 % of wake epochs
+            if art.any():
+                burst = np.exp(-((t - rng.uniform(1, 9, size=(art.sum(), 1))) ** 2) / (2 * 0.3 ** 2))
+                sig[art] += 60 * burst * rng.standard_normal((art.sum(), N_SAMPLES))
+        return sig * gain * jit
+
     for a in range(n_animals):
-        gain = rng.uniform(0.7, 1.4)
-        f_off = rng.uniform(-0.6, 0.6)
-        pink_exp = rng.uniform(0.8, 1.2)
-        line50 = rng.uniform(0.0, 3.0)
+        gain = rng.uniform(0.6, 1.7)
+        f_off = rng.uniform(-1.0, 1.0)
+        pink_exp = rng.uniform(0.7, 1.3)
+        gamma_gain = rng.uniform(0.5, 1.5)
+        delta_gain = rng.uniform(0.6, 1.6)      # animal-specific state signatures
+        theta_gain = rng.uniform(0.6, 1.6)
+        line50 = rng.uniform(0.0, 5.0)
         for d in range(n_days):
             n = n_per_file
             states = _markov_states(n, rng)
-            pink = _pink_noise(n, N_SAMPLES, rng, pink_exp)
-            gam = signal.sosfilt(sos_gamma, rng.standard_normal((n, N_SAMPLES)), axis=-1)
-            gam /= gam.std(axis=-1, keepdims=True) + 1e-12
-            white = rng.standard_normal((n, N_SAMPLES))
-            phase = rng.uniform(0, 2 * np.pi, size=(n, 1))
-            sig = np.zeros((n, N_SAMPLES))
-            # SWS
-            m = states == 1
-            if m.any():
-                f = rng.uniform(1.0, 4.0, size=(m.sum(), 1)) + 0.3 * f_off
-                env = 1.0 + 0.5 * np.sin(2 * np.pi * 0.2 * t + rng.uniform(0, 6.28, size=(m.sum(), 1)))
-                sig[m] = (70 * gain * env * np.sin(2 * np.pi * f * t + phase[m])
-                          + 15 * pink[m] + 3 * gam[m])
-            # REM (theta + theta-phase-locked gamma)
-            m = states == 2
-            if m.any():
-                f = rng.uniform(6.0, 9.0, size=(m.sum(), 1)) + f_off
-                th = 2 * np.pi * f * t + phase[m]
-                sig[m] = (25 * gain * np.sin(th)
-                          + 7 * (1.0 + 0.8 * np.cos(th)) * gam[m]
-                          + 8 * pink[m])
-            # Wake
-            m = states == 0
-            if m.any():
-                f = rng.uniform(4.0, 8.0, size=(m.sum(), 1)) + f_off
-                sig[m] = (18 * gain * pink[m] + 9 * gam[m] + 8 * white[m]
-                          + 8 * np.sin(2 * np.pi * f * t + phase[m]))
+            sig = synth(states, gain, f_off, pink_exp, gamma_gain, delta_gain, theta_gain)
+            # transitional epochs: at a state change, the epoch is a mixture of both states
+            change = np.flatnonzero(np.r_[False, states[1:] != states[:-1]])
+            if len(change):
+                prev = synth(states[change - 1], gain, f_off, pink_exp, gamma_gain, delta_gain, theta_gain)
+                w = rng.uniform(0.3, 0.6, size=(len(change), 1))
+                sig[change] = (1 - w) * sig[change] + w * prev
             sig += line50 * np.sin(2 * np.pi * 50.0 * t)
             # drop-out (flat) epochs as seen in the real data
             flat = rng.random(n) < 0.02
