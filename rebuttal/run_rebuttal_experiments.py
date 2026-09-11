@@ -1477,24 +1477,44 @@ def stage_shap(ctx: Context) -> None:
         sc = booster.get_score(importance_type=kind)
         imp[kind] = [sc.get(f, sc.get(f"f{i}", 0.0)) for i, f in enumerate(ENGINEERED)]
     imp.sort_values("gain", ascending=False).to_csv(ctx.results / "xgb_gain_importance.csv", index=False)
-    # stratified sample for SHAP
-    n = min(ctx.cfg["shap_n"], len(y))
-    if n < len(y):
-        sub, _ = train_test_split(np.arange(len(y)), train_size=n, stratify=y, random_state=ctx.args.seed)
-    else:
-        sub = np.arange(len(y))
-    Xs = X.iloc[sub]
+    # Out-of-fold SHAP attributions: for each leave-one-animal-out fold, refit the
+    # XGBoost model on the other animals and explain a stratified sample of the
+    # HELD-OUT animal's epochs with that fold's model.  The pooled attributions are
+    # therefore computed on epochs the explaining model never saw (the all-animals
+    # model above is kept only for the gain importance table).
+    meta = ctx.meta()
+    splits = make_splits("loao", meta, y)
+    n_total = min(ctx.cfg["shap_n"], len(y))
+    per_fold = max(50, n_total // max(1, len(splits)))
     tm = Timer("shap")
-    explainer = shap.TreeExplainer(model)
-    sv = explainer.shap_values(Xs)
-    if isinstance(sv, list):
-        sv_list = [np.asarray(s) for s in sv]
-    else:
-        sv = np.asarray(sv)
-        sv_list = [sv[:, :, c] for c in range(sv.shape[2])] if sv.ndim == 3 else [sv]
-    LOG.info("[shap] SHAP values for %d epochs computed in %s", n, hms(tm.elapsed()))
-    np.savez_compressed(ctx.results / "shap_values.npz", shap=np.stack(sv_list, axis=-1), X=Xs.to_numpy(),
-                        y=y[sub], idx=sub, feature_names=np.array(ENGINEERED), class_names=np.array(ctx.class_names))
+    sub_all, sv_parts = [], []
+    for fname, tr, te in splits:
+        n_te = min(per_fold, len(te))
+        if n_te < len(te):
+            strat = y[te] if np.min(np.bincount(y[te], minlength=ctx.K())) >= 2 else None
+            sub_te, _ = train_test_split(te, train_size=n_te, stratify=strat, random_state=ctx.args.seed)
+        else:
+            sub_te = te
+        fold_model = make_xgb(ctx.cfg["xgb_trees"], ctx.args.seed, ctx.args.n_jobs)
+        fold_model.fit(X.iloc[tr], y[tr])
+        sv = shap.TreeExplainer(fold_model).shap_values(X.iloc[sub_te])
+        if isinstance(sv, list):
+            arr = np.stack([np.asarray(s_) for s_ in sv], axis=-1)      # (n, p, K)
+        else:
+            arr = np.asarray(sv)
+            arr = arr if arr.ndim == 3 else arr[:, :, None]
+        sv_parts.append(arr)
+        sub_all.append(sub_te)
+        LOG.info("[shap] fold %s: out-of-fold SHAP for %d held-out epochs", fname, n_te)
+    sub = np.concatenate(sub_all)
+    sv_arr = np.concatenate(sv_parts, axis=0)
+    sv_list = [sv_arr[:, :, c] for c in range(sv_arr.shape[2])]
+    Xs = X.iloc[sub]
+    n = len(sub)
+    LOG.info("[shap] out-of-fold SHAP values for %d epochs (%d folds) computed in %s", n, len(splits), hms(tm.elapsed()))
+    np.savez_compressed(ctx.results / "shap_values.npz", shap=sv_arr, X=Xs.to_numpy(),
+                        y=y[sub], idx=sub, animal=meta["animal"].to_numpy()[sub],
+                        feature_names=np.array(ENGINEERED), class_names=np.array(ctx.class_names))
     ma = pd.DataFrame({"feature": ENGINEERED})
     for c, name in enumerate(ctx.class_names):
         ma[f"mean_abs_shap_{name}"] = np.abs(sv_list[c]).mean(axis=0)

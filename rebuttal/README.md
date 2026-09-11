@@ -220,7 +220,9 @@ top-label and per-class ECE, log-loss (`results/calibration_*.csv`,
     fig_shap_mean_abs_bar          mean |SHAP| per feature, stacked by class
     fig_xgb_gain_importance        XGBoost gain importance
     fig_calibration_xgb_loao       reliability curves + ECE / MCE / Brier
-  models/xgb_all_animals.json      XGBoost trained on all animals (SHAP model)
+  models/xgb_all_animals.json      XGBoost trained on all animals (gain-importance table only;
+                                   SHAP attributions are out-of-fold: each LOAO fold's model
+                                   explains a stratified sample of its held-out animal)
 ```
 
 Tags: `loao__xgb`, `loao__logreg`, ..., `loro__xgb`, `random80_20__xgb__<variant>`,
