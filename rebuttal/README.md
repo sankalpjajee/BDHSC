@@ -45,11 +45,12 @@ python run_rebuttal_experiments.py --selfcheck
 # 2. smoke test on synthetic data (no real data needed, ~5-10 min)
 python run_rebuttal_experiments.py --synthetic 120 --quick --out-dir /tmp/rebuttal_smoke
 
-# 3. the real thing (HPC path used by the NN script, or the notebook's relative path)
+# 3. the real thing (the --label-map value below is an EXAMPLE: confirm the integer-to-state
+#    mapping from the competition data description and the printed class counts first) (HPC path used by the NN script, or the notebook's relative path)
 python run_rebuttal_experiments.py \
     --data-dir /path/to/stage1_labeled \
     --out-dir ./rebuttal_out \
-    --label-map "0:Wake,1:SWS,2:REM" \
+    --label-map "0:REM,1:SWS,2:Wake" \
     --n-jobs 8
 #   (the directory that holds the 16 files 0_0.csv ... 7_1.csv)
 
@@ -95,7 +96,7 @@ workstation (no GPU):
 | random_split (4 variants × 3 repeats; the two raw-sample variants have 5,000+ columns; the replica uses 100 trees) | 1-2 h |
 | loao_replica (paper design matrix, 5,006 columns, 100 trees, 8 folds) | 2-3 h on 4 cores (skip with `--stages` if short of time) |
 | ablation (7 sets × 8 folds) | 1-1.5 h |
-| cnn (optional; CPU) | 2-4 h (minutes on a GPU) |
+| cnn (optional; one seed) | ≈5-8 h on CPU, ≈2 h on a GPU |
 | stats, calibration, shap, figures, report | < 10 min |
 
 i.e. roughly half a day without the CNN, one day with it. Peak memory is about
