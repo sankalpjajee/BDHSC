@@ -102,6 +102,7 @@ i.e. roughly half a day without the CNN, one day with it. Peak memory is about
 12 GB (raw epochs cached as float32 = 2.8 GB, plus the raw-sample design
 matrices in `random_split`). Useful switches:
 
+* `--exclude-flat` — drop the constant-valued (ADC-zero drop-out) epochs from training and evaluation in every protocol; run once with and once without (different `--out-dir`) to report both;
 * `--quick` — 60 trees instead of 500, fewer bootstraps, 2 random-split repeats;
   for smoke tests only.
 * `--models xgb,logreg,rf` — subset of LOAO models; `--loro-models`.
@@ -123,7 +124,7 @@ Computed per epoch in microvolts (the notebook MMD on volts, to reproduce the
 published feature exactly):
 
 * Welch PSD (Hann, `nperseg=1000`, 50 % overlap, 0.5 Hz resolution); absolute
-  and relative power in delta 0.5-4, theta 4-8, alpha 8-12, beta 12-30, gamma
+  and relative power in delta 0.5-4, theta 4-8, alpha 8-13, beta 13-30, gamma
   30-100 Hz (half-open bins, sum × Δf); per-band peak frequency; total power
   0.5-100 Hz; normalised spectral entropy; theta/delta and delta/gamma ratios.
 * Hjorth activity, mobility, complexity; line length; zero-crossing rate (of the

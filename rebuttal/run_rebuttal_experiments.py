@@ -120,12 +120,14 @@ LABEL_COL = str(N_SAMPLES)   # "5000"
 FLAT_VALUE = -7.629511e-08   # value of the constant (drop-out) rows seen in the real data
 FILE_RE = re.compile(r"^(\d+)_(\d+)\.csv$")
 
-# Band edges used for the engineered features (paper: alpha 8-12, beta 12-30).
+# Band edges used for the engineered features.  These are the edges the archived
+# notebook actually used (alpha 8-13, beta 13-30 Hz); the manuscript text (8-12 /
+# 12-30) is corrected to them in the revision.  Intervals are half-open [lo, hi).
 BANDS: Dict[str, Tuple[float, float]] = {
     "delta": (0.5, 4.0),
     "theta": (4.0, 8.0),
-    "alpha": (8.0, 12.0),
-    "beta": (12.0, 30.0),
+    "alpha": (8.0, 13.0),
+    "beta": (13.0, 30.0),
     "gamma": (30.0, 100.0),
 }
 # Band edges used by the notebook's periodogram features (kept only for the
@@ -1050,10 +1052,28 @@ class Context:
         return len(self.class_values)
 
 
+EXCLUDE_FLAT = False   # set from --exclude-flat in main(); constant (drop-out) epochs leave train AND test
+
+
 def make_splits(protocol: str, meta: pd.DataFrame, y: np.ndarray, repeats: int = 3, seed: int = 42):
-    """Return a list of (fold_name, train_idx, test_idx)."""
+    """Return a list of (fold_name, train_idx, test_idx).  With --exclude-flat the
+    constant-valued (ADC-zero) epochs are removed from both partitions of every
+    fold, so all metrics are computed on scorable epochs only."""
     n = len(meta)
     idx = np.arange(n)
+    if EXCLUDE_FLAT and "is_flat" in meta.columns:
+        keep = ~meta["is_flat"].to_numpy(dtype=bool)
+        idx = idx[keep]
+        if protocol == "random80_20":
+            out = []
+            for r in range(repeats):
+                tr, te = train_test_split(idx, test_size=0.2, stratify=y[idx], random_state=seed + r)
+                out.append((f"seed{seed + r}", tr, te))
+            return out
+        g = meta["animal"].to_numpy()[idx] if protocol == "loao" else \
+            (meta["animal"].astype(str) + "_" + meta["day"].astype(str)).to_numpy()[idx]
+        pref = "animal" if protocol == "loao" else "rec"
+        return [(f"{pref}{a}", idx[g != a], idx[g == a]) for a in np.unique(g)]
     if protocol == "loao":
         g = meta["animal"].to_numpy()
         return [(f"animal{a}", idx[g != a], idx[g == a]) for a in np.unique(g)]
@@ -1995,6 +2015,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                    help="dtype of the cached raw epochs (float64 reproduces the notebook MMD bit-exactly)")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--force", action="store_true", help="recompute stages whose outputs exist")
+    p.add_argument("--exclude-flat", action="store_true",
+                   help="drop constant-valued (drop-out) epochs from training and evaluation in every protocol; "
+                        "run once with and once without (different --out-dir) to report both")
     p.add_argument("--selfcheck", action="store_true", help="verify MMD/PAC/metric implementations and exit")
     return p.parse_args(argv)
 
@@ -2012,6 +2035,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     unknown = [s for s in args.stage_list if s not in STAGES]
     if unknown:
         raise SystemExit(f"unknown stages {unknown}; valid: {STAGES}")
+    global EXCLUDE_FLAT
+    EXCLUDE_FLAT = bool(args.exclude_flat)
     cfg = {
         "xgb_trees": 60 if args.quick else 500,
         "xgb_default_trees": 20 if args.quick else 100,
